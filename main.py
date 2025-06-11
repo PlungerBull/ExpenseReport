@@ -6,7 +6,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.formula.translate import Translator
 from openpyxl.worksheet.table import Table
-import win32com.client  # Import the win32com.client library
+import win32com.client
 import time
 
 ################### PATH MANAGER ###################
@@ -35,8 +35,7 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
     """
     Reads an Excel file, filters data by 'owner', creates new Excel files,
     pastes data and formulas, converts the range to a an Excel Table.
-
-    NOTE: Pivot table refresh will be done manually by the user in Excel.
+    Also filters the 'cecoOwner' sheet based on the current owner.
     """
 
     report_period = input("Please enter the period for the report (e.g., 2023_Q4): ")
@@ -44,13 +43,16 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
         print("Report period cannot be empty. Exiting.")
         return
 
-    # Define the columns to read from the ORIGINAL Expense Report Main.xlsx: A to N (indices 0-13) and P (index 15)
-    cols_to_read_indices_original = list(range(14)) + [15]
+    # Define the columns to read from the ORIGINAL Expense Report Main.xlsx:
+    # We read ALL columns from A to P from the source file because the 'owner'
+    # column (which is a formula column in the template) is used for filtering.
+    # The source file *must* contain 'owner' data for the filter to work.
+    cols_to_read_indices_original = list(range(16)) # This covers A:P (indices 0-15)
 
-    print(f"Reading 'dataRaw' sheet (columns A-N and P) from '{original_file_path}'...")
+    print(f"Reading 'dataRaw' sheet (columns A-P) from '{original_file_path}'...")
     try:
         df_data_raw_original = pd.read_excel(original_file_path, sheet_name='dataRaw', usecols=cols_to_read_indices_original)
-        print("Successfully read 'dataRaw' sheet (columns A-N and P).")
+        print("Successfully read 'dataRaw' sheet (columns A-P).")
     except KeyError:
         print("Error: 'dataRaw' sheet not found in the Excel file. Please ensure the sheet name is 'dataRaw'.")
         return
@@ -58,8 +60,10 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
         print(f"An error occurred while reading the original Excel file: {e}")
         return
 
+    # The filtering for 'owner' still relies on the 'owner' column being present.
+    # This 'owner' column in df_data_raw_original should contain actual values from the source file.
     if "owner" not in df_data_raw_original.columns:
-        print("Error: 'owner' column not found in 'dataRaw' sheet. Please ensure 'owner' is the header for column P.")
+        print("Error: 'owner' column not found in 'dataRaw' sheet. Please ensure 'owner' is the header for column N in your source data.")
         return
 
     unique_owners = df_data_raw_original['owner'].dropna().unique().tolist()
@@ -76,13 +80,17 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
 
         formulas_to_copy = {}
         formula_start_row = 2  # Formulas are assumed to be in row 2 of the template
-        formula_cols = [15, 16, 17, 18]  # O, P, Q, R (columns 15 to 18)
+        # Formulas are now in M, N, O, P (indices 12, 13, 14, 15)
+        # M: helper, N: owner, O: subOwner, P: centroCostoDescrip
+        formula_cols = [13, 14, 15, 16] # M, N, O, P (1-based index)
 
         for col_idx in formula_cols:
             cell = template_ws_temp.cell(row=formula_start_row, column=col_idx)
             if cell.data_type == 'f':  # 'f' means formula
                 formulas_to_copy[col_idx] = cell.value
             else:
+                # If a formula is expected but not found, this warning will trigger.
+                # This is a good sanity check for your template.
                 print(
                     f"Warning: Cell {get_column_letter(col_idx)}{formula_start_row} in template is not a formula. It will not be copied down.")
                 formulas_to_copy[col_idx] = None  # Mark as None if no formula
@@ -96,7 +104,6 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
     except Exception as e:
         print(f"An error occurred while pre-reading formulas from template: {e}")
         return
-    total_expense_soles = 0.0  # NEW: Initialize a variable to store the sum of 'Saldo Soles'
 
     # Ensure output directory exists
     os.makedirs(output_directory, exist_ok=True)
@@ -110,7 +117,9 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
 
         df_filtered_for_owner_all_cols = df_data_raw_original[df_data_raw_original['owner'] == owner].copy()
 
-        cols_to_write_back = df_data_raw_original.columns[:14].tolist()  # A-N
+        # Columns to write back are A to L (indices 0 to 11)
+        # 'lineP&L' (L, index 11) is the last data column.
+        cols_to_write_back = df_filtered_for_owner_all_cols.columns[:12].tolist()
         df_filtered_for_owner = df_filtered_for_owner_all_cols[cols_to_write_back]
 
         try:
@@ -120,32 +129,79 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
 
             # 2. Load the copied workbook
             wb = openpyxl.load_workbook(new_file_path)
-            ws_data = wb['dataContable']  # The sheet where raw data and table will be
-            # ws_pivot = wb['ExpenseReport'] # This line is no longer strictly needed if not interacting with pivot table object
+            ws_data = wb['dataContable']
 
-            # 3. Clear existing data (A-N) from row 2 onwards on dataContable sheet
-            print(f"Clearing existing data in columns A-N from row 2 onwards...")
+            # --- Processing 'cecoOwner' sheet ---
+            try:
+                ws_ceco_owner = wb['cecoOwner']
+                print(f"Processing 'cecoOwner' sheet for owner: '{owner}'...")
+
+                # Read the headers from the first row
+                headers_ceco = [cell.value for cell in ws_ceco_owner[1]]
+
+                # Read the data from the sheet starting from row 2
+                data_ceco = []
+                for r_idx in range(2, ws_ceco_owner.max_row + 1):
+                    row_values = [ws_ceco_owner.cell(row=r_idx, column=c_idx).value for c_idx in
+                                  range(1, ws_ceco_owner.max_column + 1)]
+                    data_ceco.append(row_values)
+
+                df_ceco = pd.DataFrame(data_ceco, columns=headers_ceco)
+
+                if not df_ceco.empty:
+                    # Filter out rows where 'mainOwner' is not equal to the current 'owner'
+                    if 'mainOwner' in df_ceco.columns:
+                        df_ceco_filtered_data = df_ceco[
+                            df_ceco['mainOwner'].astype(str).str.strip().str.lower() == str(owner).strip().lower()
+                            ].copy()
+                    else:
+                        print("Warning: 'mainOwner' column not found in 'cecoOwner' sheet. Skipping filtering.")
+                        df_ceco_filtered_data = pd.DataFrame(columns=headers_ceco)  # Create empty df with headers
+
+                    # Clear existing data rows (from row 2 onwards)
+                    print("Clearing existing data rows in 'cecoOwner' sheet from row 2 onwards...")
+                    for r_idx in range(ws_ceco_owner.max_row, 1, -1):  # From max_row down to 2
+                        ws_ceco_owner.delete_rows(r_idx)
+                    print("Finished clearing 'cecoOwner' data rows.")
+
+                    # Write filtered data rows back to 'cecoOwner' sheet, starting from row 2
+                    print(f"Writing {len(df_ceco_filtered_data)} filtered rows to 'cecoOwner' sheet, starting row 2.")
+                    for r_idx, row_data in enumerate(df_ceco_filtered_data.values.tolist()):
+                        for c_idx, cell_value in enumerate(row_data):
+                            ws_ceco_owner.cell(row=r_idx + 2, column=c_idx + 1,
+                                               value=cell_value)  # +2 because we start from row 2
+                    print("Finished writing filtered data to 'cecoOwner'.")
+                else:
+                    print("Warning: 'cecoOwner' sheet is empty or only has headers. No filtering applied.")
+
+            except KeyError:
+                print(f"Warning: 'cecoOwner' sheet not found in '{new_file_name}'. Skipping filtering for this sheet.")
+            except Exception as e:
+                print(f"An error occurred while processing 'cecoOwner' sheet: {e}")
+
+            # 3. Clear existing data (A-L) from row 2 onwards on dataContable sheet
+            print(f"Clearing existing data in columns A-L from row 2 onwards...")
+            # Now clearing 12 columns (A to L, 1-based index 1 to 12)
             for r_idx in range(2, ws_data.max_row + 1):
-                for c_idx in range(1, 15):  # Columns A to N (1 to 14)
+                for c_idx in range(1, 13): # Columns A to L (1 to 12)
                     cell_to_clear = ws_data.cell(row=r_idx, column=c_idx)
-                    # --- TYPO FIX HERE ---
                     if cell_to_clear.value is not None:
                         cell_to_clear.value = None
             print("Finished clearing data.")
 
-            # 4. Write headers (A-N) to the first row (A1 to N1) on dataContable sheet
+            # 4. Write headers (A-L) to the first row (A1 to L1) on dataContable sheet
             headers = list(df_filtered_for_owner.columns)
             for col_idx, header_name in enumerate(headers):
                 ws_data.cell(row=1, column=col_idx + 1, value=header_name)
 
-            # 5. Write filtered data (A-N) starting from row 2 on dataContable sheet
+            # 5. Write filtered data (A-L) starting from row 2 on dataContable sheet
             start_row_for_data = 2
             min_col_data = 1
 
             data_to_write = df_filtered_for_owner.values.tolist()
             num_rows_to_write = len(data_to_write)
 
-            print(f"Writing {num_rows_to_write} rows of data to columns A-N, starting from row {start_row_for_data}...")
+            print(f"Writing {num_rows_to_write} rows of data to columns A-L, starting from row {start_row_for_data}...")
             for r_idx, row_data in enumerate(data_to_write):
                 if not row_data and len(row_data) == 0:
                     continue
@@ -157,12 +213,12 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
                         break
             print("Finished writing data.")
 
-            # 6. Copy Formulas Down in Columns O, P, Q, R on dataContable sheet
+            # 6. Copy Formulas Down in Columns M, N, O, P on dataContable sheet
             last_data_row = start_row_for_data + num_rows_to_write - 1
             if num_rows_to_write == 0:
                 last_data_row = 1
 
-            print(f"Copying formulas down to row {last_data_row} for columns O-R...")
+            print(f"Copying formulas down to row {last_data_row} for columns M-P...")
             for col_idx_formula in formula_cols:
                 original_formula = formulas_to_copy.get(col_idx_formula)
                 if original_formula:
@@ -174,12 +230,13 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
                             target_cell_coords)
                         ws_data.cell(row=target_row, column=col_idx_formula, value=translated_formula)
                 else:
-                    pass
+                    pass # This 'pass' is important: if formula_to_copy[col_idx] was None due to the warning, it won't try to copy.
             print("Finished copying formulas.")
 
             # 7. Convert range to Excel Table "rawData" on dataContable sheet
             table_name = "rawData"
-            last_column_of_table_ref_index = max(formula_cols)  # This will be 18 for 'R'
+            # last_column_of_table_ref_index is now column P (index 15)
+            last_column_of_table_ref_index = max(formula_cols) # This will be 16 for 'P'
 
             if num_rows_to_write == 0:
                 table_end_row = 1  # Table will only include header row
@@ -190,8 +247,11 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
 
             tables_to_remove = []
             for table_entry in ws_data._tables:
-                if (isinstance(table_entry, Table) and table_entry.name == table_name) or \
-                        (isinstance(table_entry, str) and table_entry == table_name):
+                # openpyxl returns Table objects or strings for tables
+                if isinstance(table_entry, Table) and table_entry.name == table_name:
+                    tables_to_remove.append(table_entry)
+                elif isinstance(table_entry, str) and table_entry == table_name:
+                    # In older openpyxl or certain scenarios, it might be just the name string
                     tables_to_remove.append(table_entry)
             for item in tables_to_remove:
                 ws_data._tables.remove(item)
@@ -201,7 +261,6 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
             ws_data.add_table(tab)
             print(f"Created Excel Table '{table_name}' with range '{new_table_ref}'.")
 
-            # --- NEW ADDITION START ---
             # 8. Go to the 'ExpenseReport' sheet and write 'pivotTableSource' in cell C2
             try:
                 ws_pivot = wb['ExpenseReport']
@@ -223,19 +282,6 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
             wb.save(new_file_path)
             print(f"Successfully updated file for owner '{owner}' and saved to '{new_file_name}'.")
 
-            # 11. Read Saldo Soles column from the newly created file and add to total
-            try:
-                df_temp = pd.read_excel(new_file_path, sheet_name='dataContable', usecols=["Saldo Soles"])  # Adjust column name if different
-                if 'Saldo Soles' in df_temp.columns:
-                    current_file_sum = df_temp['Saldo Soles'].sum()
-                    total_expense_soles += current_file_sum
-                    print(f"  Added {current_file_sum:.2f} from '{new_file_name}' to total.")
-                else:
-                    print(
-                        "  Warning: 'Saldo Soles' column not found in the newly created file. Skipping sum for this file.")
-            except Exception as e:
-                print(f"  Error reading 'Saldo Soles' from '{new_file_name}': {e}")
-
         except KeyError as ke:
             print(f"Error: Missing sheet in the template file. Check sheet names ('dataContable'): {ke}")
         except Exception as e:
@@ -243,15 +289,58 @@ def process_expense_reports(original_file_path, template_file_path, output_direc
 
     print("\nAll expense reports generated successfully!")
     print(f"You can find the generated files in: {output_directory}")
-    print(f"Total Expense for the period is: {total_expense_soles:,.2f}")  # Formatted to 2 decimal places and comma separator
+
+def calculate_total_saldo_soles(output_directory, template_file_path):
+    """
+    Calculates the total 'Saldo Soles' from all generated Excel files in the
+    output directory, excluding the template file.
+
+    Args:
+        output_directory (str): The path to the folder where processed files are.
+        template_file_path (str): The full path to the template file.
+
+    Returns:
+        float: The sum of 'Saldo Soles' from all relevant files.
+    """
+    total_saldo_soles = 0.0
+    template_file_name = os.path.basename(template_file_path)
+
+    print(f"\n--- Calculating total 'Saldo Soles' from files in: {output_directory} ---")
+    excel_files = [f for f in os.listdir(output_directory) if f.endswith(('.xlsx', '.xlsm'))]
+
+    if not excel_files:
+        print("No Excel files found in the output folder to calculate sum.")
+        return 0.0
+
+    for file_name in excel_files:
+        if file_name == template_file_name:
+            print(f"  Skipping template file: '{file_name}'")
+            continue
+
+        file_path = os.path.join(output_directory, file_name)
+        try:
+            # Read 'Saldo Soles' column from 'dataContable' sheet
+            # Saldo Soles is column K (index 10)
+            df_temp = pd.read_excel(file_path, sheet_name='dataContable', usecols=["Saldo Soles"])
+            if 'Saldo Soles' in df_temp.columns:
+                current_file_sum = df_temp['Saldo Soles'].sum()
+                total_saldo_soles += current_file_sum
+                print(f"  Added {current_file_sum:.2f} from '{file_name}'.")
+            else:
+                print(f"  Warning: 'Saldo Soles' column not found in the newly created file. Skipping sum for this file.")
+        except KeyError:
+            print(f"  Error: 'dataContable' sheet not found in '{file_name}'. Skipping sum for this file.")
+        except Exception as e:
+            print(f"  Error reading 'Saldo Soles' from '{file_name}': {e}")
+
+    print(f"--- Finished calculating total 'Saldo Soles'. Total: {total_saldo_soles:,.2f} ---")
+    return total_saldo_soles
+
 
 def refresh_excel_files_in_folder(folder_path):
     """
     Opens all Excel files in the specified folder, performs a 'Refresh All',
     saves, and closes them using COM automation.
-
-    Args:
-        folder_path (str): The path to the folder containing Excel files.
     """
     if not os.path.isdir(folder_path):
         print(f"Error (Folder Refresh): Folder not found at '{folder_path}'. Skipping refresh.")
@@ -268,25 +357,38 @@ def refresh_excel_files_in_folder(folder_path):
     try:
         excel_app = win32com.client.Dispatch("Excel.Application")
         excel_app.Visible = True  # Keep Excel hidden
-        excel_app.DisplayAlerts = False # Suppress alerts (e.g., about external links)
+        excel_app.DisplayAlerts = False  # Suppress alerts (e.g., about external links)
 
         for file_name in excel_files:
             file_path = os.path.join(folder_path, file_name)
             workbook = None
+            # Skip the template file during this refresh process as it's not a generated report.
+            if file_name == os.path.basename(paths['templateExpenseReport']):
+                print(f"  Skipping template file '{file_name}' from refresh cycle.")
+                continue
+
             try:
                 print(f"  Opening and refreshing: {file_name}")
                 workbook = excel_app.Workbooks.Open(file_path)
-                workbook.RefreshAll() # The core refresh command
-                excel_app.CalculateUntilAsyncQueriesDone() # Wait for queries to complete
+
+                # --- ONLY REFRESH, NO PIVOTTABLE SOURCE CHANGE ---
+                # The assumption here is that your template's PivotTable
+                # is already correctly configured to refresh itself based on the
+                # data in the 'dataContable' sheet, perhaps using a dynamic named range
+                # or an existing table reference that updates automatically.
+
+                workbook.RefreshAll()  # The core refresh command
+                excel_app.CalculateUntilAsyncQueriesDone()  # Wait for queries to complete
+                time.sleep(1) # Small pause after refresh
 
                 workbook.Save()
                 print(f"  Successfully refreshed and saved: {file_name}")
                 time.sleep(3)
             except Exception as e:
-                print(f"  Error refreshing '{file_name}': {e}")
+                print(f"  Error processing '{file_name}': {e}")
             finally:
                 if workbook:
-                    workbook.Close(SaveChanges=False) # Close without saving again, as we already saved
+                    workbook.Close(SaveChanges=False)
 
     except Exception as e:
         print(f"An error occurred with Excel COM application: {e}")
@@ -311,6 +413,7 @@ def move_files_to_history(output_directory, history_directory, template_file_pat
     template_file_name = os.path.basename(template_file_path)
 
     moved_count = 0
+    print(f"\n--- Starting to move files to history: {history_directory} ---")
     for file_name in os.listdir(output_directory):
         if file_name.endswith(('.xlsx', '.xlsm')) and file_name != template_file_name:
             source_path = os.path.join(output_directory, file_name)
@@ -338,3 +441,5 @@ if __name__ == "__main__":
     move_files_to_history(output_folder, history_folder, template_excel_file_path)
     process_expense_reports(original_excel_file_path, template_excel_file_path, output_folder)
     refresh_excel_files_in_folder(output_folder)
+    final_total_expense_soles = calculate_total_saldo_soles(output_folder, template_excel_file_path)
+    print(f"\nFINAL TOTAL EXPENSE FOR THE PERIOD: {final_total_expense_soles:,.2f}")
