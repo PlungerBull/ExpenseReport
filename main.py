@@ -568,11 +568,14 @@ if __name__ == "__main__":
     sales_report_path = paths['salesDataStorage']
     expense_report_data_actual_path = paths['expenseReportDataActual']
 
-    #move_files_to_history(output_folder, history_folder, template_excel_file_path)
-    #process_expense_reports(original_excel_file_path, template_excel_file_path, output_folder)
-    #refresh_excel_files_in_folder(output_folder)
+    #### EXPENSE REPORT ####
+    # move_files_to_history(output_folder, history_folder, template_excel_file_path)
+    # process_expense_reports(original_excel_file_path, template_excel_file_path, output_folder)
+    # refresh_excel_files_in_folder(output_folder)
     # final_total_expense_soles = calculate_total_saldo_soles(output_folder, template_excel_file_path)
     # print(f"\nFINAL TOTAL EXPENSE FOR THE PERIOD: {final_total_expense_soles:,.2f}")
 
+    #### SALES REPORT ####
     period_input = str(input("Please enter the period (e.g., '2023-12'): "))
     process_sales_reports(expense_report_data_actual_path, sales_report_path, period_input)
+    move_files_to_history(sales_report_path, history_folder)
