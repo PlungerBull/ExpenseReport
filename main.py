@@ -9,6 +9,7 @@ from openpyxl.worksheet.table import Table
 import win32com.client
 import time
 import ctypes
+import pyodbc
 
 ################### PATH MANAGER ###################
 JSON_FILE_PATH = "C:/Users/Public/paths.json"
@@ -334,7 +335,6 @@ def calculate_total_saldo_soles(output_directory, template_file_path):
     print(f"--- Finished calculating total 'Saldo Soles'. Total: {total_saldo_soles:,.2f} ---")
     return total_saldo_soles
 
-
 def refresh_excel_files_in_folder(folder_path):
     """
     Opens all Excel files in the specified folder, performs a 'Refresh All',
@@ -394,7 +394,6 @@ def refresh_excel_files_in_folder(folder_path):
         if excel_app:
             excel_app.Quit()
         print(f"--- Finished 'Refresh All' for files in: {folder_path} ---")
-
 
 def move_files_to_history(output_directory, history_directory, template_file_path):
     """
@@ -559,6 +558,278 @@ def process_sales_reports(input_folder_path, output_folder_path, period):
     except Exception as e:
         print(f"Error saving or opening the Excel file: {e}")
 
+def template_forecast_generator(access_db_path: str, excel_template_path: str, output_folder_path: str):
+    """
+    Accesses a table in an Access database, filters and transforms the data,
+    separates content by unique 'subOwner' values, pastes each subset into
+    a template Excel file, and saves it with a dynamic name.
+    Additionally, this version extends formulas in columns AH and AI
+    down to the last row of pasted data using win32com.
+
+    Args:
+        access_db_path (str): The full path to the Access database file.
+        excel_template_path (str): The full path to the Excel template file.
+        output_folder_path (str): The path to the folder where output Excel files will be saved.
+    """
+
+    # 1. Prompt for User Input
+    user_forecast_version = input("Please enter the forecasting version (e.g., '6+6', 'Q3'): ")
+    if not user_forecast_version:
+        print("Forecasting version cannot be empty. Exiting.")
+        return
+
+    # Static parameters, defined inside the function as requested
+    access_table_name = "fullDetailedP&L"
+    column_for_separation = "subOwner"
+    excel_template_sheet_name = "forecastExpenses"
+    template_header_row = 7
+    data_start_row = 8
+    fixed_identifier_columns = [
+        "company", "lineP&L", "centroCosto",
+        "description", "cuentaContable", "descriptionCuentaContable"
+    ]
+
+    initial_columns_from_db = fixed_identifier_columns + ["mainOwner", "subOwner", "periodo", "saldoPEN"]
+
+    company_replacements_map = {
+        'ROP': 'FLXTECH'
+    }
+
+    if not all([access_db_path, excel_template_path, output_folder_path]):
+        print("Error: One or more required paths passed as arguments are missing or None.")
+        print(f"Access DB Path: {access_db_path}")
+        print(f"Excel Template Path: {excel_template_path}")
+        print(f"Output Folder Path: {output_folder_path}")
+        return
+
+    print("\n--- Starting Data Processing ---")
+    print(f"Access Database: {access_db_path}")
+    print(f"Table Name: {access_table_name}")
+    print(f"Splitting by: {column_for_separation}")
+    print(f"Template Sheet: {excel_template_sheet_name}")
+
+    os.makedirs(output_folder_path, exist_ok=True)
+
+    try:
+        conn_str = (
+            r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
+            f"DBQ={access_db_path};"
+        )
+
+        print("Connecting to Access database...")
+        cnxn = pyodbc.connect(conn_str)
+
+        columns_to_select_str = ", ".join(f"[{col}]" for col in initial_columns_from_db)
+        query = f"SELECT {columns_to_select_str} FROM [{access_table_name}]"
+
+        df = pd.read_sql(query, cnxn)
+
+        cnxn.close()
+        print("Database connection closed. Data retrieved.")
+
+        if company_replacements_map:
+            print(f"Applying company name replacements...")
+            for old_value, new_value in company_replacements_map.items():
+                initial_count = (df['company'] == old_value).sum()
+                if initial_count > 0:
+                    df['company'] = df['company'].replace(old_value, new_value)
+                    final_count = (df['company'] == old_value).sum()
+                    print(
+                        f"  Replaced '{old_value}' with '{new_value}'. {initial_count - final_count} occurrences replaced.")
+                else:
+                    print(f"  '{old_value}' not found in 'company' column. No replacement made for this value.")
+
+        initial_rows = len(df)
+        df = df[~df['cuentaContable'].astype(str).str.startswith('62')].copy()
+        rows_after_filter = len(df)
+        print(
+            f"Filtered 'cuentaContable': Removed {initial_rows - rows_after_filter} rows where 'cuentaContable' started with '62'.")
+
+        print("Performing data transformations...")
+
+        df['periodo'] = pd.to_datetime(df['periodo'])
+        df['periodo'] = df['periodo'].dt.to_period('M').dt.end_time
+        df['periodo_month_name'] = df['periodo'].dt.strftime('%B')
+
+        id_vars_for_pivot = fixed_identifier_columns + ["mainOwner", "subOwner"]
+
+        df_unpivoted = df.pivot_table(
+            index=id_vars_for_pivot,
+            columns='periodo_month_name',
+            values='saldoPEN',
+            fill_value=0
+        ).reset_index()
+
+        month_names_ordered = [
+            'January', 'February', 'March', 'April', 'May', 'June',
+            'July', 'August', 'September', 'October', 'November', 'December'
+        ]
+
+        existing_month_columns = [col for col in month_names_ordered if col in df_unpivoted.columns]
+        final_data_table_columns_order = fixed_identifier_columns + existing_month_columns
+
+        print("Data transformation complete. Ready to generate Excel files.")
+
+        unique_subowners = df_unpivoted[column_for_separation].unique()
+
+        if len(unique_subowners) == 0:
+            print("No unique 'subOwner' values found. No Excel files will be generated.")
+            return
+
+        print(f"Found {len(unique_subowners)} unique {column_for_separation} values. Processing each...")
+
+        excel_app = None # Initialize outside the loop
+
+        for i, subowner in enumerate(unique_subowners):
+            print(f"\nProcessing '{subowner}' ({i + 1}/{len(unique_subowners)})...")
+
+            df_filtered = df_unpivoted[df_unpivoted[column_for_separation] == subowner].copy()
+
+            unique_main_owners_for_subowner = df_filtered['mainOwner'].unique()
+
+            if len(unique_main_owners_for_subowner) > 1:
+                main_owner_for_cell_D4 = ", ".join(map(str, unique_main_owners_for_subowner))
+                print(f"Warning: Multiple mainOwners found for subOwner '{subowner}'. Using: {main_owner_for_cell_D4}")
+            elif len(unique_main_owners_for_subowner) == 1:
+                main_owner_for_cell_D4 = str(unique_main_owners_for_subowner[0])
+            else:
+                main_owner_for_cell_D4 = "N/A"
+
+            sub_owner_for_cell_D5 = str(subowner)
+
+            df_filtered_for_paste = df_filtered[final_data_table_columns_order]
+            num_data_rows = len(df_filtered_for_paste) # Get the number of rows we're pasting
+
+            sanitized_subowner = "".join(c for c in str(subowner) if c.isalnum() or c in [' ', '_', '-']).strip()
+            output_filename = f"Forecast_{user_forecast_version}_{sanitized_subowner}.xlsx"
+            output_filepath = os.path.join(output_folder_path, output_filename)
+
+            try:
+                shutil.copy(excel_template_path, output_filepath)
+                print(f"Copied template to: {output_filepath}")
+            except Exception as e:
+                print(f"Error copying template for '{subowner}': {e}")
+                continue
+
+            # 7. Excel Manipulation with openpyxl (for pasting data)
+            # This part remains with openpyxl as it's efficient for writing large dataframes
+            try:
+                workbook = openpyxl.load_workbook(output_filepath)
+                sheet = workbook[excel_template_sheet_name]
+
+                sheet['D4'].value = main_owner_for_cell_D4
+                sheet['D5'].value = sub_owner_for_cell_D5
+                print(
+                    f"Main Owner ('{main_owner_for_cell_D4}') and Sub Owner ('{sub_owner_for_cell_D5}') written to D4/D5.")
+
+                data_to_paste = df_filtered_for_paste.values.tolist()
+
+                # Clear previous data in data table range (optional, good practice for templates)
+                max_col_idx = len(final_data_table_columns_order)
+                # clear_until_row = max(data_start_row + num_data_rows + 5, sheet.max_row) # This could be too aggressive
+                # Let's clear based on the expected new data size
+                clear_until_row = data_start_row + 1000 # Clear enough rows to ensure old data is gone, or adjust as needed for your template size
+                for row_num in range(data_start_row, clear_until_row + 1):
+                    for col_num in range(3, max_col_idx + 3): # Start clearing from column C (3)
+                        sheet.cell(row=row_num, column=col_num).value = None
+
+
+                # Write data rows starting from data_start_row (row 8)
+                # Data starts pasting at column C (3rd column)
+                for r_idx, row_data in enumerate(data_to_paste):
+                    for c_idx, value in enumerate(row_data):
+                        sheet.cell(row=data_start_row + r_idx, column=c_idx + 3, value=value)
+
+                print(f"Main data table pasted.")
+
+                workbook.save(output_filepath)
+                print(f"Workbook saved (Openpyxl).")
+
+            except Exception as e:
+                print(f"Error during openpyxl processing for '{subowner}': {e}")
+                continue
+
+            # 8. Excel Manipulation with win32com.client (for refreshing and now, for formula copying)
+            try:
+                # Get Excel Application object
+                try:
+                    excel_app = win32com.client.GetActiveObject("Excel.Application")
+                except:
+                    excel_app = win32com.client.Dispatch("Excel.Application")
+
+                excel_app.Visible = False # Keep Excel hidden
+                excel_app.DisplayAlerts = False # Suppress alerts
+
+                workbook_com = excel_app.Workbooks.Open(output_filepath)
+                sheet_com = workbook_com.Sheets(excel_template_sheet_name) # Get the specific sheet object
+
+                # --- NEW ADDITION START: Copying formulas using win32com ---
+                if num_data_rows > 0:
+                    print("Extending formulas in columns AH and AI using win32com...")
+
+                    # Define the source range (AH8:AI8)
+                    source_range = sheet_com.Range("AH8:AI8")
+
+                    # Calculate the last row for pasting formulas
+                    # If data starts at row 8, and num_data_rows are pasted,
+                    # the last data row is (data_start_row + num_data_rows - 1).
+                    # We want to paste formulas down to this last data row.
+                    last_formula_row = data_start_row + num_data_rows - 1
+
+                    # Define the destination range for formulas (e.g., AH9:AI[last_formula_row])
+                    # Ensure the destination range starts from the row *after* the source formula row
+                    if last_formula_row >= data_start_row + 1: # Ensure there's at least one row to copy to
+                        destination_range_str = f"AH{data_start_row + 1}:AI{last_formula_row}"
+                        destination_range = sheet_com.Range(destination_range_str)
+
+                        # Copy the source range
+                        source_range.Copy()
+
+                        # Paste special: Formulas
+                        # xlPasteFormulas = -4123
+                        # xlPasteValues = -4163
+                        # xlPasteFormats = -4122
+                        # xlPasteAll = -4104
+                        destination_range.PasteSpecial(Paste=-4123) # xlPasteFormulas
+
+                        excel_app.CutCopyMode = False # Clear clipboard after pasting
+
+                        print(f"Formulas from AH8:AI8 copied down to {destination_range_str} (win32com).")
+                    else:
+                        print("Not enough data rows to extend formulas (win32com).")
+                else:
+                    print("No data rows pasted, skipping formula extension (win32com).")
+                # --- NEW ADDITION END ---
+
+                print(f"Refreshing all formulas and connections in '{output_filename}'...")
+                workbook_com.RefreshAll()
+
+                time.sleep(5) # Give Excel some time to refresh
+
+                workbook_com.Save()
+                workbook_com.Close(False) # Close without saving changes if any (already saved by .Save())
+                print(f"Workbook refreshed and saved (win32com).")
+
+            except Exception as e:
+                print(f"Error during win32com Excel automation for '{subowner}': {e}")
+            finally:
+                if excel_app is not None:
+                    try:
+                        # Check if no other workbooks are open before quitting Excel entirely
+                        if excel_app.Workbooks.Count == 0:
+                            excel_app.Quit()
+                            print("Excel application quit.")
+                        else:
+                            print("Excel application not quit (other workbooks are open).")
+                    except Exception as e:
+                        print(f"Error quitting Excel application: {e}")
+                excel_app = None # Reset for next iteration
+
+    except Exception as e:
+        print(f"An error occurred during the main process: {e}")
+    finally:
+        print("\n--- Data Processing Complete ---")
+
 # --- Main execution block ---
 if __name__ == "__main__":
     original_excel_file_path = paths['ExpenseReport']
@@ -567,6 +838,9 @@ if __name__ == "__main__":
     history_folder = paths['expenseReportHistory']
     sales_report_path = paths['salesDataStorage']
     expense_report_data_actual_path = paths['expenseReportDataActual']
+    forecast_access_db_path = paths['statementsFP&A']
+    forecast_template_excel_path = paths['expenseForecastTemplate']
+    forecast_output_folder = paths['outputForecastTemplate']
 
     #### EXPENSE REPORT ####
     # move_files_to_history(output_folder, history_folder, template_excel_file_path)
@@ -576,6 +850,9 @@ if __name__ == "__main__":
     # print(f"\nFINAL TOTAL EXPENSE FOR THE PERIOD: {final_total_expense_soles:,.2f}")
 
     #### SALES REPORT ####
-    period_input = str(input("Please enter the period (e.g., '2023-12'): "))
-    process_sales_reports(expense_report_data_actual_path, sales_report_path, period_input)
-    move_files_to_history(sales_report_path, history_folder)
+    # period_input = str(input("Please enter the period (e.g., '2023-12'): "))
+    # process_sales_reports(expense_report_data_actual_path, sales_report_path, period_input)
+    # move_files_to_history(sales_report_path, history_folder)
+
+    #### FORECAST TEMPLATE GENERATOR ####
+    template_forecast_generator(access_db_path=forecast_access_db_path, excel_template_path=forecast_template_excel_path, output_folder_path=forecast_output_folder)
