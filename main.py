@@ -558,13 +558,38 @@ def process_sales_reports(input_folder_path, output_folder_path, period):
     except Exception as e:
         print(f"Error saving or opening the Excel file: {e}")
 
+def _apply_company_replacements(df: pd.DataFrame, replacements_map: dict, df_name: str) -> pd.DataFrame:
+    """Applies company name replacements to a DataFrame."""
+    if replacements_map:
+        print(f"Applying company name replacements to {df_name} data...")
+        for old_value, new_value in replacements_map.items():
+            initial_count = (df['company'] == old_value).sum()
+            if initial_count > 0:
+                df['company'] = df['company'].replace(old_value, new_value)
+                final_count = (df['company'] == old_value).sum()
+                print(f"  Replaced '{old_value}' with '{new_value}'. {initial_count - final_count} occurrences replaced in {df_name} data.")
+            else:
+                print(f"  '{old_value}' not found in 'company' column of {df_name} data. No replacement made for this value.")
+    return df
+
+def _clear_excel_range(sheet, start_row: int, max_col_idx: int, clear_until_row: int):
+    """Clears a specified range in an Openpyxl worksheet."""
+    for row_num in range(start_row, clear_until_row + 1):
+        for col_num in range(3, max_col_idx + 3): # Assuming data starts at column C (index 3)
+            sheet.cell(row=row_num, column=col_num).value = None
+
 def template_forecast_generator(access_db_path: str, excel_template_path: str, output_folder_path: str):
     """
-    Accesses a table in an Access database, filters and transforms the data,
+    Accesses tables in an Access database, filters and transforms data,
     separates content by unique 'subOwner' values, pastes each subset into
     a template Excel file, and saves it with a dynamic name.
-    Additionally, this version extends formulas in columns AH and AI
-    down to the last row of pasted data using win32com.
+    This version includes processing for both 'forecastExpenses' and 'forecastHeadcount' sheets.
+    For 'forecastExpenses', it extends formulas in columns AH and AI down.
+    For 'forecastHeadcount', it pivots headcount data and pastes it into the designated sheet,
+    now directly filtering by 'subOwner' and 'mainOwner' from the headcount data itself.
+
+    This optimized version consolidates database connections, pre-loads all data,
+    and uses helper functions to reduce code duplication.
 
     Args:
         access_db_path (str): The full path to the Access database file.
@@ -578,18 +603,24 @@ def template_forecast_generator(access_db_path: str, excel_template_path: str, o
         print("Forecasting version cannot be empty. Exiting.")
         return
 
-    # Static parameters, defined inside the function as requested
-    access_table_name = "fullDetailedP&L"
-    column_for_separation = "subOwner"
-    excel_template_sheet_name = "forecastExpenses"
-    template_header_row = 7
+    # Static parameters
+    access_expense_table_name = "fullDetailedP&L"
+    access_headcount_table_name = "headcountFull"
+    column_for_separation = "subOwner" # This remains the primary column for file separation
+    excel_expenses_sheet_name = "forecastExpenses"
+    excel_headcount_sheet_name = "forecastHeadcount"
+    template_header_row = 7 # Not directly used in data pasting, but good for context
     data_start_row = 8
-    fixed_identifier_columns = [
+    fixed_identifier_columns_expenses = [
         "company", "lineP&L", "centroCosto",
         "description", "cuentaContable", "descriptionCuentaContable"
     ]
+    fixed_identifier_columns_headcount = [
+        "company", "centroCosto", "description", "jobGeneral"
+    ]
 
-    initial_columns_from_db = fixed_identifier_columns + ["mainOwner", "subOwner", "periodo", "saldoPEN"]
+    initial_columns_from_db_expenses = fixed_identifier_columns_expenses + ["mainOwner", "subOwner", "periodo", "saldoPEN"]
+    initial_columns_from_db_headcount = ["company", "period", "nameID", "centroCosto", "jobGeneral", "description", "mainOwner", "subOwner"]
 
     company_replacements_map = {
         'ROP': 'FLXTECH'
@@ -604,59 +635,65 @@ def template_forecast_generator(access_db_path: str, excel_template_path: str, o
 
     print("\n--- Starting Data Processing ---")
     print(f"Access Database: {access_db_path}")
-    print(f"Table Name: {access_table_name}")
+    print(f"Expense Table Name: {access_expense_table_name}")
+    print(f"Headcount Table Name: {access_headcount_table_name}")
     print(f"Splitting by: {column_for_separation}")
-    print(f"Template Sheet: {excel_template_sheet_name}")
+    print(f"Template Expense Sheet: {excel_expenses_sheet_name}")
+    print(f"Template Headcount Sheet: {excel_headcount_sheet_name}")
 
     os.makedirs(output_folder_path, exist_ok=True)
 
+    df_expenses = pd.DataFrame()
+    df_headcount = pd.DataFrame()
+    cnxn = None # Initialize connection object
+    excel_app = None # Initialize Excel application object for win32com
+
     try:
+        # --- Consolidated Database Connection and Data Loading ---
+        print("\n--- Connecting to Access database and retrieving all data ---")
         conn_str = (
             r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
             f"DBQ={access_db_path};"
         )
-
-        print("Connecting to Access database...")
         cnxn = pyodbc.connect(conn_str)
+        print("Database connection established.")
 
-        columns_to_select_str = ", ".join(f"[{col}]" for col in initial_columns_from_db)
-        query = f"SELECT {columns_to_select_str} FROM [{access_table_name}]"
+        # Load Expense Data
+        columns_to_select_str_expenses = ", ".join(f"[{col}]" for col in initial_columns_from_db_expenses)
+        query_expenses = f"SELECT {columns_to_select_str_expenses} FROM [{access_expense_table_name}]"
+        df_expenses = pd.read_sql(query_expenses, cnxn)
+        print("Expense data retrieved.")
 
-        df = pd.read_sql(query, cnxn)
+        # Load Headcount Data
+        columns_to_select_str_headcount = ", ".join(f"[{col}]" for col in initial_columns_from_db_headcount)
+        query_headcount = f"SELECT {columns_to_select_str_headcount} FROM [{access_headcount_table_name}]"
+        df_headcount = pd.read_sql(query_headcount, cnxn)
+        print("Headcount data retrieved.")
 
         cnxn.close()
-        print("Database connection closed. Data retrieved.")
+        print("Database connection closed.")
 
-        if company_replacements_map:
-            print(f"Applying company name replacements...")
-            for old_value, new_value in company_replacements_map.items():
-                initial_count = (df['company'] == old_value).sum()
-                if initial_count > 0:
-                    df['company'] = df['company'].replace(old_value, new_value)
-                    final_count = (df['company'] == old_value).sum()
-                    print(
-                        f"  Replaced '{old_value}' with '{new_value}'. {initial_count - final_count} occurrences replaced.")
-                else:
-                    print(f"  '{old_value}' not found in 'company' column. No replacement made for this value.")
+        # --- Apply company replacements to both datasets using helper function ---
+        df_expenses = _apply_company_replacements(df_expenses, company_replacements_map, "expense")
+        df_headcount = _apply_company_replacements(df_headcount, company_replacements_map, "headcount")
 
-        initial_rows = len(df)
-        df = df[~df['cuentaContable'].astype(str).str.startswith('62')].copy()
-        rows_after_filter = len(df)
-        print(
-            f"Filtered 'cuentaContable': Removed {initial_rows - rows_after_filter} rows where 'cuentaContable' started with '62'.")
+        # --- Expense Data Transformations (Now applied to the full df_expenses) ---
+        initial_rows_expenses = len(df_expenses)
+        df_expenses = df_expenses[~df_expenses['cuentaContable'].astype(str).str.startswith('62')].copy()
+        rows_after_filter_expenses = len(df_expenses)
+        print(f"Filtered 'cuentaContable' for expenses: Removed {initial_rows_expenses - rows_after_filter_expenses} rows where 'cuentaContable' started with '62'.")
 
-        print("Performing data transformations...")
+        print("Performing expense data transformations...")
+        df_expenses['periodo'] = pd.to_datetime(df_expenses['periodo'])
+        df_expenses['periodo'] = df_expenses['periodo'].dt.to_period('M').dt.end_time
+        df_expenses['periodo_month_name'] = df_expenses['periodo'].dt.strftime('%B')
 
-        df['periodo'] = pd.to_datetime(df['periodo'])
-        df['periodo'] = df['periodo'].dt.to_period('M').dt.end_time
-        df['periodo_month_name'] = df['periodo'].dt.strftime('%B')
-
-        id_vars_for_pivot = fixed_identifier_columns + ["mainOwner", "subOwner"]
-
-        df_unpivoted = df.pivot_table(
-            index=id_vars_for_pivot,
+        id_vars_for_pivot_expenses = fixed_identifier_columns_expenses + ["mainOwner", "subOwner"]
+        df_unpivoted_expenses_full = df_expenses.pivot_table(
+            index=id_vars_for_pivot_expenses,
             columns='periodo_month_name',
             values='saldoPEN',
+            aggfunc='sum',
             fill_value=0
         ).reset_index()
 
@@ -665,12 +702,25 @@ def template_forecast_generator(access_db_path: str, excel_template_path: str, o
             'July', 'August', 'September', 'October', 'November', 'December'
         ]
 
-        existing_month_columns = [col for col in month_names_ordered if col in df_unpivoted.columns]
-        final_data_table_columns_order = fixed_identifier_columns + existing_month_columns
+        # --- Headcount Data Transformations (Now applied to the full df_headcount) ---
+        print("Performing headcount data transformations on full dataset...")
+        df_headcount['period'] = pd.to_datetime(df_headcount['period'])
+        df_headcount['period'] = df_headcount['period'].dt.to_period('M').dt.end_time
+        df_headcount['period_month_name'] = df_headcount['period'].dt.strftime('%B')
 
-        print("Data transformation complete. Ready to generate Excel files.")
+        headcount_pivot_index = fixed_identifier_columns_headcount + ["mainOwner", "subOwner"] # Include for full pivot
+        df_pivoted_headcount_full = df_headcount.pivot_table(
+            index=headcount_pivot_index,
+            columns='period_month_name',
+            values='nameID',
+            aggfunc='count',
+            fill_value=0
+        ).reset_index()
 
-        unique_subowners = df_unpivoted[column_for_separation].unique()
+
+        print("Data pre-processing complete. Ready to generate Excel files.")
+
+        unique_subowners = df_unpivoted_expenses_full[column_for_separation].unique()
 
         if len(unique_subowners) == 0:
             print("No unique 'subOwner' values found. No Excel files will be generated.")
@@ -678,156 +728,162 @@ def template_forecast_generator(access_db_path: str, excel_template_path: str, o
 
         print(f"Found {len(unique_subowners)} unique {column_for_separation} values. Processing each...")
 
-        excel_app = None # Initialize outside the loop
-
-        for i, subowner in enumerate(unique_subowners):
-            print(f"\nProcessing '{subowner}' ({i + 1}/{len(unique_subowners)})...")
-
-            df_filtered = df_unpivoted[df_unpivoted[column_for_separation] == subowner].copy()
-
-            unique_main_owners_for_subowner = df_filtered['mainOwner'].unique()
-
-            if len(unique_main_owners_for_subowner) > 1:
-                main_owner_for_cell_D4 = ", ".join(map(str, unique_main_owners_for_subowner))
-                print(f"Warning: Multiple mainOwners found for subOwner '{subowner}'. Using: {main_owner_for_cell_D4}")
-            elif len(unique_main_owners_for_subowner) == 1:
-                main_owner_for_cell_D4 = str(unique_main_owners_for_subowner[0])
-            else:
-                main_owner_for_cell_D4 = "N/A"
-
-            sub_owner_for_cell_D5 = str(subowner)
-
-            df_filtered_for_paste = df_filtered[final_data_table_columns_order]
-            num_data_rows = len(df_filtered_for_paste) # Get the number of rows we're pasting
-
-            sanitized_subowner = "".join(c for c in str(subowner) if c.isalnum() or c in [' ', '_', '-']).strip()
-            output_filename = f"Forecast_{user_forecast_version}_{sanitized_subowner}.xlsx"
-            output_filepath = os.path.join(output_folder_path, output_filename)
-
+        try:
+            # Get Excel Application object (only once)
             try:
-                shutil.copy(excel_template_path, output_filepath)
-                print(f"Copied template to: {output_filepath}")
-            except Exception as e:
-                print(f"Error copying template for '{subowner}': {e}")
-                continue
+                excel_app = win32com.client.GetActiveObject("Excel.Application")
+            except:
+                excel_app = win32com.client.Dispatch("Excel.Application")
+            excel_app.Visible = False
+            excel_app.DisplayAlerts = False
+            print("Excel application instance obtained for win32com operations.")
 
-            # 7. Excel Manipulation with openpyxl (for pasting data)
-            # This part remains with openpyxl as it's efficient for writing large dataframes
-            try:
-                workbook = openpyxl.load_workbook(output_filepath)
-                sheet = workbook[excel_template_sheet_name]
+            for i, subowner in enumerate(unique_subowners):
+                print(f"\nProcessing '{subowner}' ({i + 1}/{len(unique_subowners)})...")
 
-                sheet['D4'].value = main_owner_for_cell_D4
-                sheet['D5'].value = sub_owner_for_cell_D5
-                print(
-                    f"Main Owner ('{main_owner_for_cell_D4}') and Sub Owner ('{sub_owner_for_cell_D5}') written to D4/D5.")
+                # --- Determine file paths and copy template ---
+                sanitized_subowner = "".join(c for c in str(subowner) if c.isalnum() or c in [' ', '_', '-']).strip()
+                output_filename = f"Forecast_{user_forecast_version}_{sanitized_subowner}.xlsx"
+                output_filepath = os.path.join(output_folder_path, output_filename)
 
-                data_to_paste = df_filtered_for_paste.values.tolist()
-
-                # Clear previous data in data table range (optional, good practice for templates)
-                max_col_idx = len(final_data_table_columns_order)
-                # clear_until_row = max(data_start_row + num_data_rows + 5, sheet.max_row) # This could be too aggressive
-                # Let's clear based on the expected new data size
-                clear_until_row = data_start_row + 1000 # Clear enough rows to ensure old data is gone, or adjust as needed for your template size
-                for row_num in range(data_start_row, clear_until_row + 1):
-                    for col_num in range(3, max_col_idx + 3): # Start clearing from column C (3)
-                        sheet.cell(row=row_num, column=col_num).value = None
-
-
-                # Write data rows starting from data_start_row (row 8)
-                # Data starts pasting at column C (3rd column)
-                for r_idx, row_data in enumerate(data_to_paste):
-                    for c_idx, value in enumerate(row_data):
-                        sheet.cell(row=data_start_row + r_idx, column=c_idx + 3, value=value)
-
-                print(f"Main data table pasted.")
-
-                workbook.save(output_filepath)
-                print(f"Workbook saved (Openpyxl).")
-
-            except Exception as e:
-                print(f"Error during openpyxl processing for '{subowner}': {e}")
-                continue
-
-            # 8. Excel Manipulation with win32com.client (for refreshing and now, for formula copying)
-            try:
-                # Get Excel Application object
                 try:
-                    excel_app = win32com.client.GetActiveObject("Excel.Application")
-                except:
-                    excel_app = win32com.client.Dispatch("Excel.Application")
+                    shutil.copy(excel_template_path, output_filepath)
+                    print(f"Copied template to: {output_filepath}")
+                except Exception as e:
+                    print(f"Error copying template for '{subowner}': {e}")
+                    continue
 
-                excel_app.Visible = False # Keep Excel hidden
-                excel_app.DisplayAlerts = False # Suppress alerts
+                # --- Openpyxl for pasting data (both sheets) ---
+                try:
+                    workbook = openpyxl.load_workbook(output_filepath)
 
-                workbook_com = excel_app.Workbooks.Open(output_filepath)
-                sheet_com = workbook_com.Sheets(excel_template_sheet_name) # Get the specific sheet object
+                    # --- Expense Sheet Processing with openpyxl ---
+                    print(f"Processing '{excel_expenses_sheet_name}' sheet...")
+                    df_filtered_expenses = df_unpivoted_expenses_full[df_unpivoted_expenses_full[column_for_separation] == subowner].copy()
 
-                # --- NEW ADDITION START: Copying formulas using win32com ---
-                if num_data_rows > 0:
-                    print("Extending formulas in columns AH and AI using win32com...")
+                    unique_main_owners_for_subowner = df_filtered_expenses['mainOwner'].unique()
 
-                    # Define the source range (AH8:AI8)
-                    source_range = sheet_com.Range("AH8:AI8")
-
-                    # Calculate the last row for pasting formulas
-                    # If data starts at row 8, and num_data_rows are pasted,
-                    # the last data row is (data_start_row + num_data_rows - 1).
-                    # We want to paste formulas down to this last data row.
-                    last_formula_row = data_start_row + num_data_rows - 1
-
-                    # Define the destination range for formulas (e.g., AH9:AI[last_formula_row])
-                    # Ensure the destination range starts from the row *after* the source formula row
-                    if last_formula_row >= data_start_row + 1: # Ensure there's at least one row to copy to
-                        destination_range_str = f"AH{data_start_row + 1}:AI{last_formula_row}"
-                        destination_range = sheet_com.Range(destination_range_str)
-
-                        # Copy the source range
-                        source_range.Copy()
-
-                        # Paste special: Formulas
-                        # xlPasteFormulas = -4123
-                        # xlPasteValues = -4163
-                        # xlPasteFormats = -4122
-                        # xlPasteAll = -4104
-                        destination_range.PasteSpecial(Paste=-4123) # xlPasteFormulas
-
-                        excel_app.CutCopyMode = False # Clear clipboard after pasting
-
-                        print(f"Formulas from AH8:AI8 copied down to {destination_range_str} (win32com).")
+                    if len(unique_main_owners_for_subowner) > 1:
+                        main_owner_for_cell_D4 = ", ".join(map(str, unique_main_owners_for_subowner))
+                        print(f"Warning: Multiple mainOwners found for subOwner '{subowner}'. Using: {main_owner_for_cell_D4}")
+                    elif len(unique_main_owners_for_subowner) == 1:
+                        main_owner_for_cell_D4 = str(unique_main_owners_for_subowner[0])
                     else:
-                        print("Not enough data rows to extend formulas (win32com).")
-                else:
-                    print("No data rows pasted, skipping formula extension (win32com).")
-                # --- NEW ADDITION END ---
+                        main_owner_for_cell_D4 = "N/A"
 
-                print(f"Refreshing all formulas and connections in '{output_filename}'...")
-                workbook_com.RefreshAll()
+                    sub_owner_for_cell_D5 = str(subowner)
 
-                time.sleep(5) # Give Excel some time to refresh
+                    existing_month_columns_expenses = [col for col in month_names_ordered if col in df_filtered_expenses.columns]
+                    final_data_table_columns_order_expenses = fixed_identifier_columns_expenses + existing_month_columns_expenses
+                    df_filtered_for_paste_expenses = df_filtered_expenses[final_data_table_columns_order_expenses]
+                    num_data_rows_expenses = len(df_filtered_for_paste_expenses)
 
-                workbook_com.Save()
-                workbook_com.Close(False) # Close without saving changes if any (already saved by .Save())
-                print(f"Workbook refreshed and saved (win32com).")
+                    sheet_expenses = workbook[excel_expenses_sheet_name]
 
-            except Exception as e:
-                print(f"Error during win32com Excel automation for '{subowner}': {e}")
-            finally:
-                if excel_app is not None:
-                    try:
-                        # Check if no other workbooks are open before quitting Excel entirely
-                        if excel_app.Workbooks.Count == 0:
-                            excel_app.Quit()
-                            print("Excel application quit.")
+                    sheet_expenses['D4'].value = main_owner_for_cell_D4
+                    sheet_expenses['D5'].value = sub_owner_for_cell_D5
+                    print(f"Main Owner ('{main_owner_for_cell_D4}') and Sub Owner ('{sub_owner_for_cell_D5}') written to D4/D5 on '{excel_expenses_sheet_name}'.")
+
+                    data_to_paste_expenses = df_filtered_for_paste_expenses.values.tolist()
+
+                    # Clear previous data in expense data table range using helper function
+                    _clear_excel_range(sheet_expenses, data_start_row, len(final_data_table_columns_order_expenses), data_start_row + 1000)
+
+                    # Write expense data rows
+                    for r_idx, row_data in enumerate(data_to_paste_expenses):
+                        for c_idx, value in enumerate(row_data):
+                            sheet_expenses.cell(row=data_start_row + r_idx, column=c_idx + 3, value=value)
+
+                    print(f"Main data table for '{excel_expenses_sheet_name}' pasted.")
+
+
+                    # --- Headcount Data Processing and Pasting with openpyxl ---
+                    print(f"\nProcessing '{excel_headcount_sheet_name}' sheet for '{subowner}'...")
+                    df_pivoted_filtered_headcount = df_pivoted_headcount_full[
+                        (df_pivoted_headcount_full['subOwner'] == subowner)
+                    ].copy()
+
+                    if df_pivoted_filtered_headcount.empty:
+                        print(f"No headcount data found for subOwner '{subowner}'. Skipping headcount sheet update.")
+                    else:
+                        existing_month_columns_headcount = [col for col in month_names_ordered if col in df_pivoted_filtered_headcount.columns]
+                        final_data_table_columns_order_headcount = fixed_identifier_columns_headcount + existing_month_columns_headcount
+                        df_pivoted_for_paste_headcount = df_pivoted_filtered_headcount[final_data_table_columns_order_headcount]
+                        num_data_rows_headcount = len(df_pivoted_for_paste_headcount)
+
+                        sheet_headcount = workbook[excel_headcount_sheet_name]
+                        print(f"Opened sheet: '{excel_headcount_sheet_name}'.")
+
+                        data_to_paste_headcount = df_pivoted_for_paste_headcount.values.tolist()
+
+                        # Clear previous data in headcount data table range using helper function
+                        _clear_excel_range(sheet_headcount, data_start_row, len(final_data_table_columns_order_headcount), data_start_row + 1000)
+
+                        # Write headcount data rows
+                        for r_idx, row_data in enumerate(data_to_paste_headcount):
+                            for c_idx, value in enumerate(row_data):
+                                sheet_headcount.cell(row=data_start_row + r_idx, column=c_idx + 3, value=value)
+
+                        print(f"Headcount data table pasted on '{excel_headcount_sheet_name}'.")
+
+                    # Save the workbook once after all openpyxl operations on both sheets are complete
+                    workbook.save(output_filepath)
+                    print(f"Workbook saved (Openpyxl).")
+
+                except Exception as e:
+                    print(f"Error during openpyxl processing for '{subowner}': {e}")
+                    continue
+
+                # 8. Excel Manipulation with win32com.client (for refreshing and formula copying)
+                try:
+                    workbook_com = excel_app.Workbooks.Open(output_filepath)
+                    sheet_com_expenses = workbook_com.Sheets(excel_expenses_sheet_name)
+
+                    if num_data_rows_expenses > 0:
+                        print("Extending formulas in columns AH and AI of 'forecastExpenses' using win32com...")
+                        source_range = sheet_com_expenses.Range("AH8:AI8")
+                        last_formula_row_expenses = data_start_row + num_data_rows_expenses - 1
+                        if last_formula_row_expenses >= data_start_row + 1:
+                            destination_range_str_expenses = f"AH{data_start_row + 1}:AI{last_formula_row_expenses}"
+                            destination_range_expenses = sheet_com_expenses.Range(destination_range_str_expenses)
+                            source_range.Copy()
+                            destination_range_expenses.PasteSpecial(Paste=-4123) # xlPasteFormulas
+                            excel_app.CutCopyMode = False # Clear clipboard
+                            print(f"Formulas from AH8:AI8 copied down to {destination_range_str_expenses} on 'forecastExpenses'.")
                         else:
-                            print("Excel application not quit (other workbooks are open).")
-                    except Exception as e:
-                        print(f"Error quitting Excel application: {e}")
-                excel_app = None # Reset for next iteration
+                            print("Not enough expense data rows to extend formulas on 'forecastExpenses'.")
+                    else:
+                        print("No expense data rows pasted, skipping formula extension on 'forecastExpenses'.")
+
+                    print(f"Refreshing all formulas and connections in '{output_filename}' (win32com)...")
+                    workbook_com.RefreshAll()
+
+                    time.sleep(5) # Give Excel some time to refresh
+
+                    workbook_com.Save()
+                    workbook_com.Close(False)
+                    print(f"Workbook refreshed and saved (win32com).")
+
+                except Exception as e:
+                    print(f"Error during win32com Excel automation for '{subowner}': {e}")
+
+        finally: # This finally ensures excel_app is quit at the very end of the function's execution
+            if excel_app is not None:
+                try:
+                    if excel_app.Workbooks.Count == 0:
+                        excel_app.Quit()
+                        print("Excel application quit.")
+                    else:
+                        print("Excel application not quit (other workbooks are open).")
+                except Exception as e:
+                    print(f"Error quitting Excel application: {e}")
 
     except Exception as e:
         print(f"An error occurred during the main process: {e}")
     finally:
+        if cnxn and not cnxn.closed: # Ensure connection is closed if an error occurred before explicit close
+            cnxn.close()
+            print("Database connection explicitly closed in final block.")
         print("\n--- Data Processing Complete ---")
 
 # --- Main execution block ---
