@@ -2,6 +2,7 @@ import json
 import forecastTemplate
 import salesReport
 import expenseReport
+import userReport
 
 
 ################### PATH MANAGER ###################
@@ -37,17 +38,22 @@ if __name__ == "__main__":
     forecast_template_excel_path = paths['expenseForecastTemplate']
     forecast_output_folder = paths['outputForecastTemplate']
 
-    #### EXPENSE REPORT ####
+    #---------- EXPENSE REPORT ----------
     expenseReport.move_files_to_history(output_folder, history_folder, template_excel_file_path)
     expenseReport.process_expense_reports(original_excel_file_path, template_excel_file_path, output_folder)
     expenseReport.refresh_excel_files_in_folder(output_folder)
     final_total_expense_soles = expenseReport.calculate_total_saldo_soles(output_folder, template_excel_file_path)
     print(f"\nFINAL TOTAL EXPENSE FOR THE PERIOD: {final_total_expense_soles:,.2f}")
 
-    #### SALES REPORT ####
+    #---------- SALES REPORT ----------
     period_input = str(input("Please enter the period (e.g., '2023-12'): "))
     salesReport.process_sales_reports(expense_report_data_actual_path, sales_report_path, period_input)
     expenseReport.move_files_to_history(sales_report_path, history_folder)
 
-    #### FORECAST TEMPLATE GENERATOR ####
+    #---------- FORECAST TEMPLATE GENERATOR ----------
     forecastTemplate.template_forecast_generator(access_db_path=forecast_access_db_path, excel_template_path=forecast_template_excel_path, output_folder_path=forecast_output_folder)
+
+
+    #---------- USER REPORT ----------
+    REPORT_DIRECTORY = paths['usersReport']
+    userReport.process_and_alert_client_data(REPORT_DIRECTORY)
