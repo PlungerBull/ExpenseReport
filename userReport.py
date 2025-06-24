@@ -85,15 +85,25 @@ def process_and_alert_client_data(report_dir):
         df_original = pd.DataFrame(list(data_rows), columns=headers)
         print(f"Data loaded from '{initial_source_sheet_name}' sheet in-memory successfully.")
 
-        # --- Safer Sheet Management to prevent empty workbook ---
+        # ################### START Empresa Value Replacements ###################
+        empresa_replacements = {
+            "FIBERLUX TECH SOCIEDAD ANONIMA CERRADA": "FLXTECH",
+            "NEXTNET S.A.C.": "NXT",
+            "FIBERLUX SOCIEDAD ANONIMA CERRADA": "FLX"
+        }
+
+        if "Empresa" in df_original.columns:
+            # Apply the replacements to the 'Empresa' column
+            df_original["Empresa"] = df_original["Empresa"].replace(empresa_replacements)
+            print("Empresa column values replaced successfully.")
+        else:
+            print("Warning: 'Empresa' column not found in df_original for replacement.")
+
         # 1. Create the new target sheets first. This ensures the workbook always has sheets.
         ws_alerts = wb.create_sheet("ALERTS")
         ws_summary = wb.create_sheet("Summary")
         ws_clients = wb.create_sheet("Clients by status")
         print("New target sheets created.")
-
-        # 2. Now it's safe to delete the old sheets, including the original source sheet
-        # and any duplicates of our new target sheets that might have existed.
 
         # Collect all names of sheets that we want to remove from the original workbook.
         sheets_to_remove_if_old = [initial_source_sheet_name, "ALERTS", "Summary", "Clients by status"]
@@ -146,6 +156,9 @@ def process_and_alert_client_data(report_dir):
 
     # --- Prepare "ALERTS" Sheet Sections (Dependent Filters) ---
 
+    # Define common exclusion list for "Estado Servicio"
+    excluded_estados = ["Baja", "Baja Adm"]
+
     # NEW Filtro 1 Data: Clients with Plantilla Contrato = PAGOS EN CUOTA
     filtro1_new_cols = ["Empresa", "Estado Servicio", "Cliente", "Equipoventa", "Plantilla Contrato"]
     filtro1_new_actual_cols = [col for col in filtro1_new_cols if col in df_original.columns]
@@ -156,6 +169,12 @@ def process_and_alert_client_data(report_dir):
         df_temp_filtro1 = df_original[df_original["Plantilla Contrato"].isin([
             "PAGO EN CUOTAS-NEXTNET", "PAGO EN CUOTAS-TECH y NEXTNET"
         ])]
+        # ################### MODIFIED: Exclude "Baja" and "Baja Adm" from Filtro 1 ###################
+        if "Estado Servicio" in df_temp_filtro1.columns:
+            df_temp_filtro1 = df_temp_filtro1[~df_temp_filtro1["Estado Servicio"].isin(excluded_estados)]
+        else:
+            print("Warning: 'Estado Servicio' column not found in df_temp_filtro1 for exclusion.")
+
         df_filtro1_new = df_temp_filtro1[filtro1_new_actual_cols].drop_duplicates(subset=["Cliente"]).copy()
         if "Cliente" in df_filtro1_new.columns:
             clientes_in_filtro1_new = df_filtro1_new["Cliente"]
@@ -172,6 +191,13 @@ def process_and_alert_client_data(report_dir):
 
         if "Cliente" in df_temp_filtro2.columns and not clientes_in_filtro1_new.empty:
             df_temp_filtro2 = df_temp_filtro2[~df_temp_filtro2["Cliente"].isin(clientes_in_filtro1_new)]
+
+        # ################### MODIFIED: Exclude "Baja" and "Baja Adm" from Filtro 2 ###################
+        if "Estado Servicio" in df_temp_filtro2.columns:
+            df_temp_filtro2 = df_temp_filtro2[~df_temp_filtro2["Estado Servicio"].isin(excluded_estados)]
+        else:
+            print("Warning: 'Estado Servicio' column not found in df_temp_filtro2 for exclusion.")
+        # ################### END MODIFIED ###################
 
         df_filtro2_new = df_temp_filtro2[filtro2_new_actual_cols].drop_duplicates(subset=["Cliente"]).copy()
     else:
@@ -195,8 +221,8 @@ def process_and_alert_client_data(report_dir):
         df_summary_base = df_clients_by_status[required_summary_cols].copy()
 
         # Define custom order for Empresa (rows)
-        desired_empresa_order = ["FIBERLUX TECH SOCIEDAD ANONIMA CERRADA", "NEXTNET S.A.C.",
-                                 "FIBERLUX SOCIEDAD ANONIMA CERRADA"]
+        # IMPORTANT: Use the NEW (abbreviated) values here for sorting and display
+        desired_empresa_order = ["FLXTECH", "NXT", "FLX"]
         all_unique_empresas = df_summary_base['Empresa'].unique().tolist()
         final_empresas_sort_order = [emp for emp in desired_empresa_order if emp in all_unique_empresas] + \
                                     sorted([emp for emp in all_unique_empresas if emp not in desired_empresa_order])
